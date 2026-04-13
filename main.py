@@ -1,6 +1,6 @@
 import os
 import tkinter as tk
-from python_scripts.gui import PneumaticGUI
+from python_scripts.gui import HighVoltageGUI
 
 def main():
     root = tk.Tk()
@@ -15,7 +15,7 @@ def main():
             print(f"Error loading icon: {e}")
     else:
         print(f"Warning: {icon_filename} not found in {base_path}")
-    app = PneumaticGUI(root)
+    app = HighVoltageGUI(root)
     root.protocol("WM_DELETE_WINDOW", root.destroy)
     root.mainloop()
 

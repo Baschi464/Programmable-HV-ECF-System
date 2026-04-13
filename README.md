@@ -1,86 +1,120 @@
-# Modular Soft Robot Pneumatic Controller
+# Programmable HV ECF System
 
-![Python](https://img.shields.io/badge/Python-3.x-blue) ![Arduino](https://img.shields.io/badge/Firmware-Arduino-teal) ![License](https://img.shields.io/badge/License-MIT-green)
+![Python](https://img.shields.io/badge/Python-3.x-blue)
+![Firmware](https://img.shields.io/badge/Firmware-Arduino-teal)
+![Protocol](https://img.shields.io/badge/Protocol-HV%2010--token-orange)
 
-A universal, open-source control stack for pneumatic soft robots. This system provides precise pressure regulation for multi-chamber actuators, combining a high-performance Python dashboard with robust microcontroller firmware.
+This project controls an 8-channel high-voltage (HV) routing system with:
+- 8 relay outputs
+- 2 independent HV setpoints (HV1/HV2)
+- 1x MCP4728 DAC at I2C address `0x60` (channels A/B used)
 
-While currently configured for an **8-channel omnidirectional inchworm robot**, the GUI can be configured to drive systems ranging from single-actuator grippers to complex 20-channel walkers.
+The GUI workflow remains tab-based:
+- Communication
+- Program Action
+- Live Control
 
+## Architecture
 
+- Firmware target: `src/main.ino`
+- GUI: `python_scripts/gui.py`
+- Serial transport/helpers: `python_scripts/communication.py`
+- Entry point: `main.py`
 
-## ✨ Key Features
+The GUI supports channels 1-20 for programming and plotting.
+- Hardware-driven channels: 1-8
+- Virtual channels: 9-20 (valid in GUI, ignored by current firmware output)
 
-* **Scalable Architecture:** The Python GUI dynamically adjusts to control between 1 and 20 independent pressure channels.
-* **Trajectory Editor:** Visual "Click-to-Edit" graph interface for designing complex gaits (e.g., peristaltic motion, grasping sequences).
-* **Advanced Control Logic:** Implements a **State Machine Controller with Gain Scheduling**, optimizing valve response times based on pressure error magnitude and inflation/deflation states.
-* **Real-Time Telemetry:** Live visualization of pressure data with adjustable time windows.
-* **Data Logging:** One-click CSV export with smart slicing (Last 10s, 30s, Custom) for post-processing in MATLAB/Excel.
+## Serial Protocol
 
-## 🛠️ Hardware Specifications
+All commands are wrapped in angle brackets.
 
-This repository is built for the following reference hardware stack:
+### 1) Control frame (runtime)
 
-* **Microcontroller:** Arduino (Mega/Uno compatible)
-* **ADC:** 2x Adafruit ADS1115 (16-bit precision)
-* **Pressure Sensors:** **CFSensors XGZP6847A100KPGPN** (0-100 kPa)
-* **Actuation:**
-    * Binary Solenoid Valves (3/2 way)
-    * Dual Master Pump Configuration (Positive Pressure / Vacuum)
+`<r1,r2,r3,r4,r5,r6,r7,r8,v1,v2>`
 
-## 💻 Software Requirements
+- `r1..r8`: strict relay bits, each must be `0` or `1`
+- `v1`, `v2`: HV setpoints in volts (float), clamped to `0..6000`
 
-### Python Dependencies
-* Python 3.x
-* `pyserial` (Serial Communication)
-* `matplotlib` (Real-time plotting)
+Example:
 
-Install via pip:
+`<1,0,1,0,1,0,0,1,2400.0,1800.0>`
+
+### 2) Mapping frame (sent on connect)
+
+`<MAP,m1,m2,m3,m4,m5,m6,m7,m8>`
+
+- `m1..m8`: each is `1` or `2`
+- Default map: `[1,1,1,1,1,1,2,2]`
+
+Mapping is intended to be configured before runtime control.
+
+### 3) Telemetry and errors
+
+- Control echo: `ACT:r1,r2,r3,r4,r5,r6,r7,r8,v1,v2`
+- Mapping echo: `MAP:m1,m2,m3,m4,m5,m6,m7,m8`
+- Error format: `ERR:<CODE>`
+
+Common codes:
+- `ERR:MALFORMED`
+- `ERR:BAD_MAP`
+- `ERR:WATCHDOG`
+- `ERR:MAP_LOCKED`
+
+## Safety Behavior
+
+- Boot defaults: relays OFF, HV1/HV2 at 0 V
+- Watchdog: if no valid control frame within timeout, relays OFF + HV outputs to 0 V
+- GUI Pause/E-Stop/Reset: force relays OFF + HV1/HV2 to 0 V
+- Command clamp: HV setpoints are clamped to `0..6000 V`
+
+## HV to DAC Conversion
+
+Firmware computes DAC values using explicit electrical constants:
+- `DAC_REFERENCE_VOLTAGE = 5.0 V`
+- `HV_AMPLIFIER_GAIN = 1333.33`
+- `MAX_PHYSICAL_HV_VOLTAGE = DAC_REFERENCE_VOLTAGE * HV_AMPLIFIER_GAIN`
+
+The conversion path is:
+1. Clamp command voltage to safe command range (`0..6000 V`)
+2. Clamp against physical max (`MAX_PHYSICAL_HV_VOLTAGE`)
+3. Convert HV to DAC voltage by dividing by amplifier gain
+4. Map DAC voltage to 12-bit code (`0..4095`)
+
+This keeps the formula correct if you change gain or DAC reference voltage in firmware constants.
+
+## MAP Policy
+
+- GUI exposes an 8-channel mapping editor in Communication tab
+- Mapping is sent once at connect via `mapping_on_connect`
+- Mapping controls are editable only while disconnected
+- Runtime MAP edits from GUI debug box are blocked
+- Firmware can lock MAP after first valid control frame (`ERR:MAP_LOCKED`)
+
+## Setup
+
+### Python
+
+Install dependencies:
+
 ```bash
 pip install -r requirements.txt
 ```
 
-### Arduino Libraries
-* `Adafruit ADS1X15`
+Run GUI:
 
-## 🚀 Getting Started
+```bash
+python main.py
+```
 
-**Note:** For detailed wiring diagrams, pin configurations, and advanced tuning, please refer to the **[manual.pdf](manual.pdf)** included in this repository.
+### Firmware
 
-### 1. Flash the Firmware
-1.  Open the `.ino` file in the Arduino IDE.
-2.  Verify the `PIN_DEFINITIONS` match your physical wiring.
-3.  Upload the code to your board.
-4.  **Important:** Close the Arduino Serial Monitor before proceeding.
+This repository is configured for PlatformIO (`platformio.ini`) and MCP4728.
 
-### 2. Launch the Control System
-1.  Navigate to the project directory.
-2.  Run the main script:
-    ```bash
-    python main.py
-    ```
-3.  Select your COM port from the dropdown and click **Connect**.
-4.  Use the "Trajectory Editor" to draw your gait or load a preset JSON file.
+Typical build/upload:
 
-## ⚙️ Control Strategy
+```bash
+pio run
+pio run -t upload
+```
 
-The system utilizes a master-slave communication protocol:
-1.  **Python (Master):** Sends target pressure vectors to the microcontroller at a user-defined frequency.
-2.  **Arduino (Slave):**
-    * Reads the XGZP6847 sensors via I2C.
-    * Executes the **Gain Scheduled State Machine**:
-        * *High Error State:* Aggressive valve opening for fast filling/venting.
-        * *Low Error State:* Micro-pulsing for precise target convergence.
-        * *Hold State:* Valves closed (Deadband).
-    * Returns actual pressure telemetry to the UI.
-
-## 📄 Documentation
-
-A comprehensive user manual is available: **[manual.pdf](manual.pdf)**.
-It covers:
-* Electrical Schematics
-* Gait Design Strategies (Inchworm locomotion)
-* Troubleshooting Communication Deadlocks
-* Calibration of Pressure Sensors
-
----
-*Developed for the [Master Thesis in Takemura Laboratory at Keio University]*

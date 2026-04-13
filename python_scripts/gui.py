@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import serial.tools.list_ports
-from .communication import SerialCommunication
+from .communication import SerialCommunication, build_control_frame, DEFAULT_CHANNEL_MAP
 import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -15,10 +15,10 @@ import math
 import csv
 
 
-class PneumaticGUI:
+class HighVoltageGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Pneumatic System Control")
+        self.root.title("High-Voltage Routing Control")
         
         # Get screen dimensions
         screen_width = self.root.winfo_screenwidth()
@@ -36,19 +36,23 @@ class PneumaticGUI:
 
         self.comm = None
 
+        self.hardware_relay_count = 8
+        self.max_hv_voltage = 6000.0
+        self.pending_map = list(DEFAULT_CHANNEL_MAP)
+
         # One-time warning flag to avoid repeated popups when hardware is missing.
         self.hardware_disconnected_warned = False
 
-        # One-time warning flags (per channel) for missing sensors (Arduino sends "ERR").
-        self.sensor_err_warned = [False] * 20
-        
-        self.num_channels = 8 # Default number of channels
+        self.num_channels = 20
         
         # Data storage: list of dicts for each channel
-        # Each dict: {'t': [], 'target': [], 'actual': []}
         self.channel_data = [{'t': [], 'target': [], 'actual': []} for _ in range(20)]
-        self.latest_pressures = [0.0] * 20 # Store latest actual values for E-Stop
-        self.current_targets = [0.0] * 20  # Store current target values for plotting
+        self.hv_data = [{'t': [], 'target': [], 'actual': []} for _ in range(2)]
+
+        self.latest_relay_actual = [0] * self.hardware_relay_count
+        self.latest_hv_actual = [0.0, 0.0]
+        self.current_relay_targets = [0] * 20
+        self.current_hv_targets = [0.0, 0.0]
         
         self.start_time = time.time()
         
@@ -58,16 +62,14 @@ class PneumaticGUI:
         self.last_pause_timestamp = 0.0
         
         # --- Program Action State ---
-        self.current_program = {i: [] for i in range(20)} # {channel_idx: [(t, p), ...]}
+        self.current_program = {i: [] for i in range(20)}
+        self.current_hv_program = {"hv1": [], "hv2": []}
 
         # --- Action Queue State ---
         self.action_queue = []        # List of action names
         self.current_action = None    # Name of currently executing action
         self.current_action_duration = 0.0 # Duration of current action
         self.action_start_time = 0
-
-        # --- Post-action hold: keep last targets alive for N seconds after action ends ---
-        self.post_action_hold_until = 0.0   # time.time() when hold expires (0 = inactive)
 
         # Tracks the currently selected library action (Program tab)
         self.selected_library_action_name = None
@@ -89,7 +91,8 @@ class PneumaticGUI:
                 print(f"Warning: Could not create {self.action_lib_path}")
         
         # Default Y-axis limits: (min, max)
-        self.y_limits = [( -100, 100 ) for _ in range(self.num_channels)]
+        self.y_limits = [(-0.1, 1.1) for _ in range(20)]
+        self.hv_y_limits = [(0.0, self.max_hv_voltage), (0.0, self.max_hv_voltage)]
         self.x_timespan = 10.0 # Default 10 seconds
         self.load_default_settings()
 
@@ -170,26 +173,83 @@ class PneumaticGUI:
         ser = getattr(self.comm, 'ser', None)
         return bool(ser and getattr(ser, 'is_open', False))
 
-    def _warn_sensor_err_once(self, channel_idx: int):
-        """Warns once when a sensor channel reports ERR; keeps GUI usable."""
-        if channel_idx < 0:
-            return
-        if channel_idx >= len(self.sensor_err_warned):
-            self.sensor_err_warned.extend([False] * (channel_idx + 1 - len(self.sensor_err_warned)))
+    def _sanitize_relay_state(self, value):
+        try:
+            return 1 if int(value) != 0 else 0
+        except (TypeError, ValueError):
+            return 0
 
-        if self.sensor_err_warned[channel_idx]:
-            return
-        self.sensor_err_warned[channel_idx] = True
+    def _clamp_hv_value(self, value):
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            parsed = 0.0
+        return max(0.0, min(self.max_hv_voltage, parsed))
+
+    def _apply_local_control_state(self, relay_targets, hv1, hv2):
+        for i in range(self.num_channels):
+            state = relay_targets[i] if i < len(relay_targets) else 0
+            self.current_relay_targets[i] = self._sanitize_relay_state(state)
+
+        self.current_hv_targets[0] = self._clamp_hv_value(hv1)
+        self.current_hv_targets[1] = self._clamp_hv_value(hv2)
+
+    def _build_control_command(self, relay_targets=None, hv1=None, hv2=None):
+        relay_values = relay_targets if relay_targets is not None else self.current_relay_targets
+        hv1_value = self.current_hv_targets[0] if hv1 is None else hv1
+        hv2_value = self.current_hv_targets[1] if hv2 is None else hv2
+
+        hardware_relays = []
+        for i in range(self.hardware_relay_count):
+            relay = relay_values[i] if i < len(relay_values) else 0
+            hardware_relays.append(self._sanitize_relay_state(relay))
+
+        return build_control_frame(
+            hardware_relays,
+            self._clamp_hv_value(hv1_value),
+            self._clamp_hv_value(hv2_value),
+        )
+
+    def _send_control_state(self, relay_targets, hv1, hv2):
+        self._apply_local_control_state(relay_targets, hv1, hv2)
+        cmd_str = self._build_control_command(relay_targets, hv1, hv2)
+
+        if self.comm:
+            ok = self.comm.send_command(cmd_str)
+            if not ok and getattr(self.comm, 'disconnected', False):
+                self._handle_hardware_disconnected(getattr(self.comm, 'disconnected_reason', None))
+
+        return cmd_str
+
+    def _send_safe_state(self):
+        safe_relays = [0] * self.num_channels
+        return self._send_control_state(safe_relays, 0.0, 0.0)
+
+    def _parse_act_payload(self, payload):
+        parts = [p.strip() for p in payload.split(',')]
+        if len(parts) != 10:
+            return None
+
+        relays = []
+        for token in parts[:8]:
+            try:
+                relay = int(token)
+            except ValueError:
+                try:
+                    relay = int(float(token))
+                except ValueError:
+                    return None
+            if relay not in (0, 1):
+                return None
+            relays.append(relay)
 
         try:
-            messagebox.showwarning(
-                "Sensor Disconnected",
-                f"Pressure sensor on channel {channel_idx + 1} is disconnected or not responding (received 'ERR').\n\n"
-                "The GUI will keep running; this channel's actual pressure will be unavailable.",
-            )
-        except Exception:
-            # Avoid crashing the update loop if a modal can't be shown.
-            pass
+            hv1 = self._clamp_hv_value(parts[8])
+            hv2 = self._clamp_hv_value(parts[9])
+        except (TypeError, ValueError):
+            return None
+
+        return relays, [hv1, hv2]
 
     def update_loop(self):
         """Periodic loop to read data and update graphs."""
@@ -206,8 +266,7 @@ class PneumaticGUI:
             # Process Action Queue
             self.process_action_queue()
 
-            # 1. Fetch/Generate Data
-            new_values = None
+            act_values = None
 
             if self.comm:
                 raw_data = self.comm.read_latest_response()
@@ -218,49 +277,29 @@ class PneumaticGUI:
                     raw_data = None
 
                 if raw_data and raw_data.startswith("ACT:"):
-                    # Expected format: ACT:val1,val2,...
                     payload = raw_data[4:].strip()
                     if payload:
-                        parts = payload.split(',')
-                        parsed = []
-                        for i, p in enumerate(parts):
-                            token = p.strip()
-                            if not token:
-                                # Empty token -> treat as missing
-                                parsed.append(float('nan'))
-                                self._warn_sensor_err_once(i)
-                                continue
-                            if token.upper() == "ERR":
-                                parsed.append(float('nan'))
-                                self._warn_sensor_err_once(i)
-                                continue
-                            try:
-                                parsed.append(float(token))
-                            except ValueError:
-                                parsed.append(float('nan'))
-                                self._warn_sensor_err_once(i)
-                        new_values = parsed
+                        act_values = self._parse_act_payload(payload)
 
-            # 2. Store Data & Update Graphs ONLY if new data received
-            if new_values:
-                # Update latest pressures for E-Stop/Pause
-                for i, val in enumerate(new_values):
-                    if i < len(self.latest_pressures):
-                        # Keep latest_pressures numeric for formatting in Pause/E-Stop.
-                        if isinstance(val, (int, float)) and math.isfinite(val):
-                            self.latest_pressures[i] = float(val)
+            if act_values:
+                relay_actual, hv_actual = act_values
 
-                # Ensure channel_data has enough slots
-                while len(self.channel_data) < len(new_values):
-                    self.channel_data.append({'t': [], 'target': [], 'actual': []})
+                self.latest_relay_actual = list(relay_actual)
+                self.latest_hv_actual = list(hv_actual)
 
-                for i, val in enumerate(new_values):
-                    if i < len(self.channel_data):
-                        self.channel_data[i]['t'].append(current_time)
-                        self.channel_data[i]['actual'].append(val)
-                        # Use the tracked current target
-                        tgt = self.current_targets[i] if i < len(self.current_targets) else 0.0
-                        self.channel_data[i]['target'].append(tgt)
+                max_channels = min(self.num_channels, len(self.channel_data))
+                for i in range(max_channels):
+                    self.channel_data[i]['t'].append(current_time)
+                    self.channel_data[i]['target'].append(float(self.current_relay_targets[i]))
+                    if i < self.hardware_relay_count:
+                        self.channel_data[i]['actual'].append(float(relay_actual[i]))
+                    else:
+                        self.channel_data[i]['actual'].append(float('nan'))
+
+                for hv_idx in range(2):
+                    self.hv_data[hv_idx]['t'].append(current_time)
+                    self.hv_data[hv_idx]['target'].append(self.current_hv_targets[hv_idx])
+                    self.hv_data[hv_idx]['actual'].append(hv_actual[hv_idx])
 
                 # Trim stored history (keep last self.history_seconds)
                 cutoff = current_time - self.history_seconds
@@ -276,6 +315,16 @@ class PneumaticGUI:
                             self.channel_data[ch]['actual'] = self.channel_data[ch]['actual'][idx:]
                             self.channel_data[ch]['target'] = self.channel_data[ch]['target'][idx:]
 
+                    for hv_idx in range(2):
+                        hv_times = self.hv_data[hv_idx]['t']
+                        if not hv_times:
+                            continue
+                        hv_cut_idx = bisect_left(hv_times, cutoff)
+                        if hv_cut_idx > 0:
+                            self.hv_data[hv_idx]['t'] = self.hv_data[hv_idx]['t'][hv_cut_idx:]
+                            self.hv_data[hv_idx]['actual'] = self.hv_data[hv_idx]['actual'][hv_cut_idx:]
+                            self.hv_data[hv_idx]['target'] = self.hv_data[hv_idx]['target'][hv_cut_idx:]
+
                 # 3. Update Graphs
                 if self.plot_handles:
                     # Determine X-Axis limits (Moving Window)
@@ -286,20 +335,27 @@ class PneumaticGUI:
                         x_min = 0
                         x_max = self.x_timespan
 
-                    for ch_idx, handles in self.plot_handles.items():
+                    for handles in self.plot_handles.values():
                         ax = handles['ax']
                         line_actual = handles['line_actual']
                         line_target = handles['line_target']
+                        kind = handles.get('kind')
+                        index = handles.get('index')
 
                         # Update X-Axis
                         ax.set_xlim(x_min, x_max)
 
                         # Update Lines
-                        if ch_idx < len(self.channel_data):
-                            t_data = self.channel_data[ch_idx]['t']
-                            act_data = self.channel_data[ch_idx]['actual']
-                            tgt_data = self.channel_data[ch_idx]['target']
-
+                        if kind == 'relay' and index is not None and index < len(self.channel_data):
+                            t_data = self.channel_data[index]['t']
+                            act_data = self.channel_data[index]['actual']
+                            tgt_data = self.channel_data[index]['target']
+                            line_actual.set_data(t_data, act_data)
+                            line_target.set_data(t_data, tgt_data)
+                        elif kind == 'hv' and index is not None and index < len(self.hv_data):
+                            t_data = self.hv_data[index]['t']
+                            act_data = self.hv_data[index]['actual']
+                            tgt_data = self.hv_data[index]['target']
                             line_actual.set_data(t_data, act_data)
                             line_target.set_data(t_data, tgt_data)
 
@@ -333,6 +389,7 @@ class PneumaticGUI:
             self.btn_refresh.config(state="normal")
         if hasattr(self, 'btn_send'):
             self.btn_send.config(state="disabled")
+        self._set_mapping_controls_locked(False)
 
     def _handle_hardware_disconnected(self, reason=None):
         """Forcefully disconnects after a physical unplug and warns once."""
@@ -355,97 +412,86 @@ class PneumaticGUI:
         # Check if an action is currently running
         if self.current_action:
             elapsed = now - self.action_start_time
-            
-            # --- EXECUTE ACTION LOGIC ---
-            # Calculate target pressure for each channel at current time 'elapsed'
-            current_targets = []
+            relay_targets = [0] * self.num_channels
 
             # Action data is loaded ONCE when the action starts and cached in memory.
             if not hasattr(self, 'current_action_data') or self.current_action_data is None:
                 print(f"Error: No cached data for action '{self.current_action}'. Aborting.")
                 self.current_action = None
-                self.current_action_channels = {}
+                self.current_action_relay_channels = {}
                 return
 
             # Preprocessed per-channel arrays are built once at action start.
-            # Execution uses per-channel indices to avoid scanning all points each tick.
             times_by_channel = getattr(self, 'current_action_times', None)
-            pressures_by_channel = getattr(self, 'current_action_pressures', None)
+            states_by_channel = getattr(self, 'current_action_states', None)
             indices_by_channel = getattr(self, 'current_action_indices', None)
 
-            if not times_by_channel or not pressures_by_channel or not indices_by_channel:
-                print(f"Error: No preprocessed keypoints for action '{self.current_action}'. Aborting.")
+            if not times_by_channel or not states_by_channel or not indices_by_channel:
+                print(f"Error: No preprocessed relay keypoints for action '{self.current_action}'. Aborting.")
                 self.current_action = None
                 self.current_action_data = None
-                self.current_action_channels = {}
+                self.current_action_relay_channels = {}
                 self.current_action_times = []
-                self.current_action_pressures = []
+                self.current_action_states = []
                 self.current_action_indices = []
+                self.current_action_hv_times = []
+                self.current_action_hv_values = []
+                self.current_action_hv_indices = []
                 return
 
             for i in range(self.num_channels):
                 ch_times = times_by_channel[i] if i < len(times_by_channel) else []
-                ch_pressures = pressures_by_channel[i] if i < len(pressures_by_channel) else []
-
-                if not ch_times:
-                    # Channel has no keypoints → send "off" token
-                    current_targets.append("off")
-                    continue
-
+                ch_states = states_by_channel[i] if i < len(states_by_channel) else []
                 idx = indices_by_channel[i] if i < len(indices_by_channel) else 0
 
-                # Advance index while the next keypoint time has been reached
-                # (Step function: hold the last pressure until next time.)
+                if not ch_times:
+                    relay_targets[i] = 0
+                    continue
+
                 while (idx + 1) < len(ch_times) and ch_times[idx + 1] <= elapsed:
                     idx += 1
 
                 if i < len(indices_by_channel):
                     indices_by_channel[i] = idx
 
-                p_val = ch_pressures[idx] if idx < len(ch_pressures) else 0.0
-                if isinstance(p_val, str):
-                    # Toggle keypoint: "off" or "on" (on resumes at 0.0)
-                    current_targets.append("off" if p_val == "off" else "0.0")
-                else:
-                    current_targets.append(p_val)
+                state_val = ch_states[idx] if idx < len(ch_states) else 0
+                relay_targets[i] = self._sanitize_relay_state(state_val)
 
-            # Send ONE targets command per tick (all channels)
-            # Format: <p1,p2,p3,...>  — channels with no keypoints send "off"
-            cmd_str = "<" + ",".join(
-                [str(p) if isinstance(p, str) else f"{p:.1f}" for p in current_targets]
-            ) + ">"
-            if self.comm:
-                ok = self.comm.send_command(cmd_str)
-                if not ok and getattr(self.comm, 'disconnected', False):
-                    self._handle_hardware_disconnected(getattr(self.comm, 'disconnected_reason', None))
+            hv_targets = [0.0, 0.0]
+            hv_times = getattr(self, 'current_action_hv_times', [[], []])
+            hv_values = getattr(self, 'current_action_hv_values', [[], []])
+            hv_indices = getattr(self, 'current_action_hv_indices', [0, 0])
+            for hv_idx in range(2):
+                times = hv_times[hv_idx] if hv_idx < len(hv_times) else []
+                values = hv_values[hv_idx] if hv_idx < len(hv_values) else []
+                idx = hv_indices[hv_idx] if hv_idx < len(hv_indices) else 0
 
-            # Update local target storage for plotting
-            self.parse_and_store_target(cmd_str)
+                if not times:
+                    hv_targets[hv_idx] = 0.0
+                    continue
+
+                while (idx + 1) < len(times) and times[idx + 1] <= elapsed:
+                    idx += 1
+
+                if hv_idx < len(hv_indices):
+                    hv_indices[hv_idx] = idx
+
+                hv_targets[hv_idx] = self._clamp_hv_value(values[idx] if idx < len(values) else 0.0)
+
+            self._send_control_state(relay_targets, hv_targets[0], hv_targets[1])
 
             # Check if finished
             if elapsed >= self.current_action_duration:
-                # Flush the final targets into the plot data NOW, before all-off
-                # overwrites current_targets with NaN.
-                current_time = time.time() - self.start_time - self.total_paused_time
-                for i in range(min(self.num_channels, len(self.channel_data))):
-                    tgt = self.current_targets[i] if i < len(self.current_targets) else 0.0
-                    self.channel_data[i]['t'].append(current_time)
-                    self.channel_data[i]['target'].append(tgt)
-                    # Use last known actual value so the actual line isn't broken
-                    last_actual = self.channel_data[i]['actual'][-1] if self.channel_data[i]['actual'] else float('nan')
-                    self.channel_data[i]['actual'].append(last_actual)
-
-                print(f"Action '{self.current_action}' finished. Holding targets for 2s...")
+                print(f"Action '{self.current_action}' finished.")
                 self.current_action = None
-                self.current_action_data = None # Clear cache
-                self.current_action_channels = {}
+                self.current_action_data = None
+                self.current_action_relay_channels = {}
                 self.current_action_times = []
-                self.current_action_pressures = []
+                self.current_action_states = []
                 self.current_action_indices = []
-                
-                # Start a 2-second hold: channels keep their last targets.
-                # all-off will be sent when the timer expires (see below).
-                self.post_action_hold_until = time.time() + 2.0
+                self.current_action_hv_times = []
+                self.current_action_hv_values = []
+                self.current_action_hv_indices = []
                 
                 # Remove from UI Queue (Head is at index 0)
                 if self.queue_listbox.size() > 0:
@@ -454,88 +500,119 @@ class PneumaticGUI:
                 # Remove from internal list
                 if self.action_queue:
                     self.action_queue.pop(0)
+
+                if not self.action_queue:
+                    self._send_safe_state()
         
-        # --- Post-action hold timer: send all-off once the hold expires ---
-        if self.post_action_hold_until > 0 and not self.current_action:
-            if time.time() >= self.post_action_hold_until:
-                off_cmd = "<" + ",".join(["off"] * self.num_channels) + ">"
-                if self.comm:
-                    self.comm.send_command(off_cmd)
-                self.parse_and_store_target(off_cmd)
-                self.post_action_hold_until = 0.0
-                print("Post-action hold expired. Channels off.")
-            else:
-                # Keep re-sending current targets so Arduino doesn't time-out
-                # (current_targets still holds the last action values)
-                cmd_str = "<" + ",".join(
-                    [str(p) if isinstance(p, str) else f"{p:.1f}"
-                     for p in self.current_targets[:self.num_channels]]
-                ) + ">"
-                if self.comm:
-                    self.comm.send_command(cmd_str)
-        
-        # If no action is running and hold timer is done (or queue has a new action to override), check if there is one waiting
+        # If no action is running, check if there is one waiting
         if not self.current_action and self.action_queue:
             # Start the next action (FIFO -> Index 0)
             next_action = self.action_queue[0]
             
             # Load action details from disk
-            action_data = self.get_action_details(next_action)
+            action_data = self.get_action_details(next_action, show_errors=False)
             
             if action_data:
                 self.current_action = next_action
-                self.current_action_data = action_data # Cache it
-                self.current_action_channels = action_data.get("channels", {})
-                self.current_action_duration = action_data.get("total_duration", 0.0) + 0.5  # +0.5s grace so the last keypoint is held long enough
+                self.current_action_data = action_data
+                self.current_action_relay_channels = action_data.get("relay_channels", {})
+                self.current_action_hv_setpoints = action_data.get("hv_setpoints", {})
+                self.current_action_duration = float(action_data.get("total_duration", 0.0))
                 self.action_start_time = now
-                self.post_action_hold_until = 0.0  # Cancel any active hold timer
 
-                # Pre-process keypoints once (float-convert + sort by time) for efficient execution.
+                # Pre-process relay keypoints once for efficient execution.
                 self.current_action_times = [[] for _ in range(self.num_channels)]
-                self.current_action_pressures = [[] for _ in range(self.num_channels)]
+                self.current_action_states = [[] for _ in range(self.num_channels)]
                 self.current_action_indices = [0 for _ in range(self.num_channels)]
 
                 for i in range(self.num_channels):
                     ch_key = str(i + 1)
-                    raw_points = self.current_action_channels.get(ch_key, [])
+                    raw_points = self.current_action_relay_channels.get(ch_key, [])
                     processed = []
                     for pt in raw_points:
                         try:
                             t = float(pt[0])
-                            p_val = pt[1]
-                            if isinstance(p_val, str) and p_val in ("off", "on"):
-                                processed.append((t, p_val))
-                            else:
-                                processed.append((t, float(p_val)))
+                            state_val = self._sanitize_relay_state(pt[1])
+                            processed.append((t, state_val))
                         except (TypeError, ValueError, IndexError):
                             continue
 
                     processed.sort(key=lambda x: x[0])
                     if processed:
                         self.current_action_times[i] = [t for t, _ in processed]
-                        self.current_action_pressures[i] = [p for _, p in processed]
+                        self.current_action_states[i] = [state for _, state in processed]
+
+                self.current_action_hv_times = [[], []]
+                self.current_action_hv_values = [[], []]
+                self.current_action_hv_indices = [0, 0]
+
+                for hv_idx, hv_key in enumerate(("hv1", "hv2")):
+                    raw_hv_points = self.current_action_hv_setpoints.get(hv_key, [])
+                    processed_hv = []
+                    for pt in raw_hv_points:
+                        try:
+                            t = float(pt[0])
+                            hv_val = self._clamp_hv_value(pt[1])
+                            processed_hv.append((t, hv_val))
+                        except (TypeError, ValueError, IndexError):
+                            continue
+                    processed_hv.sort(key=lambda x: x[0])
+                    if processed_hv:
+                        self.current_action_hv_times[hv_idx] = [t for t, _ in processed_hv]
+                        self.current_action_hv_values[hv_idx] = [v for _, v in processed_hv]
                 
                 print(f"Starting Action: {next_action} (Duration: {self.current_action_duration}s)")
                 
                 # Highlight the active action in the listbox (Index 0)
                 self.queue_listbox.itemconfig(0, {'bg': '#90EE90'}) # Light green
             else:
-                print(f"Error: Could not load action '{next_action}'. Removing from queue.")
+                print(f"Error: Could not load action '{next_action}' (unsupported schema). Removing from queue.")
                 self.action_queue.pop(0)
                 if self.queue_listbox.size() > 0:
                     self.queue_listbox.delete(0)
 
-    def get_action_details(self, action_name):
-        """Loads action data from the JSON file."""
+    def _validate_hv_action_schema(self, action_data):
+        if not isinstance(action_data, dict):
+            return False, "Invalid JSON root. Expected an object."
+
+        if action_data.get("type") != "hv_action" or action_data.get("schema_version") != 2:
+            if "channels" in action_data:
+                return False, "Legacy pneumatic action detected. Save this action again with the HV editor to migrate it."
+            return False, "Unsupported action schema. Expected type='hv_action' and schema_version=2."
+
+        if "relay_channels" not in action_data or "hv_setpoints" not in action_data:
+            return False, "Missing required keys: relay_channels and hv_setpoints."
+
+        hv_setpoints = action_data.get("hv_setpoints", {})
+        if not isinstance(hv_setpoints, dict) or "hv1" not in hv_setpoints or "hv2" not in hv_setpoints:
+            return False, "hv_setpoints must define both hv1 and hv2 timelines."
+
+        return True, ""
+
+    def get_action_details(self, action_name, show_errors=True):
+        """Loads action data from JSON, validating HV action schema."""
         filepath = os.path.join(self.action_lib_path, f"{action_name}.json")
         if not os.path.exists(filepath):
             return None
         
         try:
             with open(filepath, 'r') as f:
-                return json.load(f)
+                action_data = json.load(f)
+
+            valid, reason = self._validate_hv_action_schema(action_data)
+            if not valid:
+                if show_errors:
+                    messagebox.showerror(
+                        "Unsupported Action",
+                        f"Action '{action_name}' cannot be loaded.\n\n{reason}",
+                    )
+                return None
+
+            return action_data
         except Exception as e:
             print(f"Failed to load action file: {e}")
+            if show_errors:
+                messagebox.showerror("Load Error", f"Failed to load action '{action_name}': {e}")
             return None
 
     def load_default_settings(self):
@@ -552,6 +629,10 @@ class PneumaticGUI:
                     
                     # Load X timespan
                     self.x_timespan = settings.get("x_timespan", self.x_timespan)
+
+                    loaded_hv_limits = settings.get("hv_y_limits", [])
+                    for i in range(min(len(loaded_hv_limits), len(self.hv_y_limits))):
+                        self.hv_y_limits[i] = tuple(loaded_hv_limits[i])
             except Exception as e:
                 print(f"Failed to load default settings: {e}")
 
@@ -559,6 +640,7 @@ class PneumaticGUI:
         config_path = os.path.join(os.path.dirname(__file__), "graphic_settings.json")
         settings = {
             "y_limits": self.y_limits,
+            "hv_y_limits": self.hv_y_limits,
             "x_timespan": self.x_timespan
         }
         try:
@@ -595,13 +677,35 @@ class PneumaticGUI:
         config_frame = ttk.LabelFrame(self.tab_comm, text="System Configuration")
         config_frame.pack(padx=10, pady=10, fill="x")
         
-        ttk.Label(config_frame, text="Number of Channels (1-20):").pack(side="left", padx=5)
+        ttk.Label(config_frame, text="GUI Channels (1-20):").pack(side="left", padx=5)
         
         self.spin_channels = ttk.Spinbox(config_frame, from_=1, to=20, width=5)
         self.spin_channels.set(self.num_channels)
         self.spin_channels.pack(side="left", padx=5)
         
         ttk.Button(config_frame, text="Apply", command=self.apply_channel_count).pack(side="left", padx=5)
+        ttk.Label(config_frame, text="HV safe range: 0 to 6000 V").pack(side="left", padx=15)
+
+        # --- Mapping Section ---
+        map_frame = ttk.LabelFrame(self.tab_comm, text="Hardware Mapping (Channels 1-8 -> HV Bus 1/2)")
+        map_frame.pack(padx=10, pady=10, fill="x")
+
+        self.map_vars = []
+        self.map_combos = []
+        for i in range(self.hardware_relay_count):
+            ttk.Label(map_frame, text=f"Ch {i+1}").grid(row=i // 4, column=(i % 4) * 2, padx=(6, 2), pady=4, sticky="w")
+
+            var = tk.StringVar(value=str(self.pending_map[i]))
+            combo = ttk.Combobox(map_frame, textvariable=var, values=["1", "2"], state="readonly", width=4)
+            combo.grid(row=i // 4, column=(i % 4) * 2 + 1, padx=(0, 10), pady=4, sticky="w")
+
+            self.map_vars.append(var)
+            self.map_combos.append(combo)
+
+        ttk.Label(
+            map_frame,
+            text="Channels 9-20 are virtual: valid in GUI actions but ignored by current firmware.",
+        ).grid(row=2, column=0, columnspan=8, padx=6, pady=(4, 2), sticky="w")
 
         # --- Manual Control Section ---
         ctrl_frame = ttk.LabelFrame(self.tab_comm, text="Manual Command (Debug)")
@@ -621,22 +725,40 @@ class PneumaticGUI:
             n = int(self.spin_channels.get())
             if 1 <= n <= 20:
                 self.num_channels = n
-                # Resize y_limits, preserving old values where possible
-                old_limits = self.y_limits
-                self.y_limits = []
-                for i in range(n):
-                    if i < len(old_limits):
-                        self.y_limits.append(old_limits[i])
-                    else:
-                        self.y_limits.append((-100, 100))
+                while len(self.y_limits) < 20:
+                    self.y_limits.append((-0.1, 1.1))
                 
                 self.refresh_live_control_ui()
                 self.update_program_channel_list() # Update program tab too
-                messagebox.showinfo("Success", f"Channel count set to {n}.")
+                messagebox.showinfo("Success", f"GUI channel count set to {n}. Channels 9-20 are virtual.")
             else:
                 messagebox.showerror("Error", "Channels must be between 1 and 20")
         except ValueError:
             messagebox.showerror("Error", "Invalid number")
+
+    def _collect_pending_map(self):
+        collected = []
+        for i in range(self.hardware_relay_count):
+            raw = self.map_vars[i].get().strip() if i < len(self.map_vars) else ""
+            if raw == "1":
+                collected.append(1)
+            elif raw == "2":
+                collected.append(2)
+            else:
+                collected.append(DEFAULT_CHANNEL_MAP[i])
+
+        self.pending_map = collected
+        return list(self.pending_map)
+
+    def _refresh_mapping_controls_from_state(self):
+        for i in range(min(len(self.map_vars), self.hardware_relay_count)):
+            value = self.pending_map[i] if i < len(self.pending_map) else DEFAULT_CHANNEL_MAP[i]
+            self.map_vars[i].set(str(value))
+
+    def _set_mapping_controls_locked(self, locked):
+        combo_state = "disabled" if locked else "readonly"
+        for combo in getattr(self, 'map_combos', []):
+            combo.config(state=combo_state)
 
     def setup_program_tab(self):
         """Sets up the Action Programming Interface."""
@@ -674,8 +796,8 @@ class PneumaticGUI:
         # Hidden by default; shown when a selected library action is renamed in the textbox.
         self.btn_rename_action = ttk.Button(frame_mgmt, text="Rename Action", command=self.rename_selected_action)
         
-        # Keypoint Editing
-        frame_edit = ttk.LabelFrame(controls, text="Edit Channel Curves")
+        # Relay keypoint editing
+        frame_edit = ttk.LabelFrame(controls, text="Edit Relay Curves")
         frame_edit.pack(fill=tk.X, padx=5, pady=10)
         
         ttk.Label(frame_edit, text="Select Channel:").pack(pady=2)
@@ -687,21 +809,21 @@ class PneumaticGUI:
         self.ent_prog_time = ttk.Entry(frame_edit)
         self.ent_prog_time.pack(fill=tk.X, padx=5, pady=2)
         
-        ttk.Label(frame_edit, text="Pressure (kPa):").pack(pady=2)
+        ttk.Label(frame_edit, text="Relay State (0/1 or OFF/ON):").pack(pady=2)
         self.ent_prog_pressure = ttk.Entry(frame_edit)
         self.ent_prog_pressure.pack(fill=tk.X, padx=5, pady=2)
         
-        self.btn_add_pt = ttk.Button(frame_edit, text="Add Keypoint", command=self.add_keypoint)
+        self.btn_add_pt = ttk.Button(frame_edit, text="Add Relay Keypoint", command=self.add_keypoint)
         self.btn_add_pt.pack(fill=tk.X, padx=5, pady=5)
 
-        self.btn_delete_pt = ttk.Button(frame_edit, text="Delete Keypoint", command=self.delete_keypoint, state="disabled")
+        self.btn_delete_pt = ttk.Button(frame_edit, text="Delete Relay Keypoint", command=self.delete_keypoint, state="disabled")
         self.btn_delete_pt.pack(fill=tk.X, padx=5, pady=(0, 5))
 
-        # Toggle OFF / ON buttons — only require time, not pressure
-        frame_toggle = ttk.LabelFrame(controls, text="Channel Toggle (OFF / ON)")
+        # Relay toggles
+        frame_toggle = ttk.LabelFrame(controls, text="Relay Toggle (OFF / ON)")
         frame_toggle.pack(fill=tk.X, padx=5, pady=5)
 
-        ttk.Label(frame_toggle, text="Adds a toggle keypoint at the time entered above.").pack(pady=2)
+        ttk.Label(frame_toggle, text="Adds a relay toggle keypoint at the time entered above.").pack(pady=2)
 
         toggle_btn_row = ttk.Frame(frame_toggle)
         toggle_btn_row.pack(fill=tk.X, padx=5, pady=5)
@@ -711,6 +833,27 @@ class PneumaticGUI:
 
         self.btn_toggle_on = ttk.Button(toggle_btn_row, text="Set ON at Time", command=self.add_toggle_on_keypoint)
         self.btn_toggle_on.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2, 0))
+
+        # HV keypoint editing
+        frame_hv = ttk.LabelFrame(controls, text="HV Setpoint Keypoints")
+        frame_hv.pack(fill=tk.X, padx=5, pady=5)
+
+        ttk.Label(frame_hv, text="Time (s):").pack(pady=2)
+        self.ent_hv_time = ttk.Entry(frame_hv)
+        self.ent_hv_time.pack(fill=tk.X, padx=5, pady=2)
+
+        ttk.Label(frame_hv, text="HV1 (V):").pack(pady=2)
+        self.ent_hv1 = ttk.Entry(frame_hv)
+        self.ent_hv1.pack(fill=tk.X, padx=5, pady=2)
+
+        ttk.Label(frame_hv, text="HV2 (V):").pack(pady=2)
+        self.ent_hv2 = ttk.Entry(frame_hv)
+        self.ent_hv2.pack(fill=tk.X, padx=5, pady=2)
+
+        hv_btn_row = ttk.Frame(frame_hv)
+        hv_btn_row.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Button(hv_btn_row, text="Add/Update HV Keypoint", command=self.add_hv_keypoint).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
+        ttk.Button(hv_btn_row, text="Clear HV Keypoints", command=self.clear_hv_keypoints).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2, 0))
 
         # --- Action Library (Program Tab) ---
         frame_lib = ttk.LabelFrame(controls, text="Action Library")
@@ -731,7 +874,7 @@ class PneumaticGUI:
         self.ax_prog = self.fig_prog.add_subplot(111)
         self.ax_prog.set_title("Action Preview")
         self.ax_prog.set_xlabel("Time (s)")
-        self.ax_prog.set_ylabel("Pressure (kPa)")
+        self.ax_prog.set_ylabel("Relay State")
         self.ax_prog.grid(True)
         
         self.canvas_prog = FigureCanvasTkAgg(self.fig_prog, master=graph_frame)
@@ -795,42 +938,59 @@ class PneumaticGUI:
             
         # Reset current program
         self.current_program = {i: [] for i in range(20)}
+        self.current_hv_program = {"hv1": [], "hv2": []}
         self.selected_keypoint = None
-        self.btn_add_pt.config(text="Add Keypoint")
+        self.btn_add_pt.config(text="Add Relay Keypoint")
         if hasattr(self, 'btn_delete_pt'):
             self.btn_delete_pt.config(state="disabled")
         
         # Load name
         self.action_name_var.set(action_data.get("name", action_name))
         
-        # Load channels
-        channels = action_data.get("channels", {})
-        for ch_str, points in channels.items():
+        # Load relay channels
+        relay_channels = action_data.get("relay_channels", {})
+        for ch_str, points in relay_channels.items():
             try:
-                ch_idx = int(ch_str) - 1 # Convert "1" -> 0
+                ch_idx = int(ch_str) - 1
                 if 0 <= ch_idx < 20:
                     loaded = []
                     for p in points:
                         t_val = float(p[0])
-                        p_val = p[1]
-                        if isinstance(p_val, str) and p_val in ("off", "on"):
-                            loaded.append((t_val, p_val))
-                        else:
-                            loaded.append((t_val, float(p_val)))
+                        p_val = 1 if int(p[1]) != 0 else 0
+                        loaded.append((t_val, p_val))
                     self.current_program[ch_idx] = loaded
             except (ValueError, TypeError, IndexError):
                 pass
+
+        # Load HV setpoint timelines
+        hv_setpoints = action_data.get("hv_setpoints", {})
+        for hv_key in ("hv1", "hv2"):
+            loaded_hv = []
+            for point in hv_setpoints.get(hv_key, []):
+                try:
+                    loaded_hv.append((float(point[0]), self._clamp_hv_value(point[1])))
+                except (ValueError, TypeError, IndexError):
+                    continue
+            loaded_hv.sort(key=lambda x: x[0])
+            self.current_hv_program[hv_key] = loaded_hv
                 
         self.update_program_graph()
 
     def program_new_action(self):
         """Resets the programming interface."""
         self.current_program = {i: [] for i in range(20)}
+        self.current_hv_program = {"hv1": [], "hv2": []}
         self.action_name_var.set("")
         self.selected_keypoint = None
-        self.btn_add_pt.config(text="Add Keypoint")
+        self.btn_add_pt.config(text="Add Relay Keypoint")
         if hasattr(self, 'btn_delete_pt'):
             self.btn_delete_pt.config(state="disabled")
+        if hasattr(self, 'ent_hv_time'):
+            self.ent_hv_time.delete(0, tk.END)
+        if hasattr(self, 'ent_hv1'):
+            self.ent_hv1.delete(0, tk.END)
+        if hasattr(self, 'ent_hv2'):
+            self.ent_hv2.delete(0, tk.END)
         self.selected_library_action_name = None
         self._hide_delete_action_button()
         self._hide_rename_action_button()
@@ -1092,8 +1252,7 @@ class PneumaticGUI:
                 continue
 
             for pt_idx, (t, p) in enumerate(points):
-                # Toggle keypoints are drawn at y=0 on the graph
-                plot_p = 0 if isinstance(p, str) else p
+                plot_p = self._sanitize_relay_state(p)
                 try:
                     sx, sy = transform((t, plot_p))
                 except Exception:
@@ -1135,14 +1294,11 @@ class PneumaticGUI:
         self.ent_prog_time.delete(0, tk.END)
         self.ent_prog_time.insert(0, str(t))
         self.ent_prog_pressure.delete(0, tk.END)
-        if isinstance(p, str):
-            self.ent_prog_pressure.insert(0, p.upper())  # "OFF" or "ON"
-        else:
-            self.ent_prog_pressure.insert(0, str(p))
+        self.ent_prog_pressure.insert(0, "ON" if self._sanitize_relay_state(p) else "OFF")
 
         # Set state
         self.selected_keypoint = {'channel': ch_idx, 'original_t': t, 'original_p': p}
-        self.btn_add_pt.config(text="Edit Keypoint")
+        self.btn_add_pt.config(text="Edit Relay Keypoint")
         if hasattr(self, 'btn_delete_pt'):
             self.btn_delete_pt.config(state="normal")
 
@@ -1166,7 +1322,7 @@ class PneumaticGUI:
 
         # Clear selection state
         self.selected_keypoint = None
-        self.btn_add_pt.config(text="Add Keypoint")
+        self.btn_add_pt.config(text="Add Relay Keypoint")
         if hasattr(self, 'btn_delete_pt'):
             self.btn_delete_pt.config(state="disabled")
 
@@ -1178,12 +1334,21 @@ class PneumaticGUI:
 
     def add_keypoint(self):
         """Adds or edits a keypoint."""
+        raw_state = self.ent_prog_pressure.get().strip().lower()
         try:
             t = float(self.ent_prog_time.get())
-            p = float(self.ent_prog_pressure.get())
-            if t < 0: raise ValueError("Time must be positive")
+            if t < 0:
+                raise ValueError("Time must be positive")
         except ValueError:
-            messagebox.showerror("Invalid Input", "Please enter valid numeric values for Time and Pressure.")
+            messagebox.showerror("Invalid Input", "Please enter a valid time in seconds.")
+            return
+
+        if raw_state in ("1", "on", "true"):
+            relay_state = 1
+        elif raw_state in ("0", "off", "false"):
+            relay_state = 0
+        else:
+            messagebox.showerror("Invalid Input", "Relay state must be 0/1 or OFF/ON.")
             return
 
         ch_idx = self.combo_prog_channel.current()
@@ -1205,7 +1370,7 @@ class PneumaticGUI:
                 
                 # Reset state
                 self.selected_keypoint = None
-                self.btn_add_pt.config(text="Add Keypoint")
+                self.btn_add_pt.config(text="Add Relay Keypoint")
                 if hasattr(self, 'btn_delete_pt'):
                     self.btn_delete_pt.config(state="disabled")
 
@@ -1218,7 +1383,7 @@ class PneumaticGUI:
             while any(abs(pt[0] - t) < 1e-5 for pt in self.current_program[ch_idx]):
                 t += 0.05
             
-        self.current_program[ch_idx].append((t, p))
+        self.current_program[ch_idx].append((t, relay_state))
         self.current_program[ch_idx].sort(key=lambda x: x[0]) # Sort by time
         
         self.update_program_graph()
@@ -1229,15 +1394,16 @@ class PneumaticGUI:
 
     @staticmethod
     def _keypoint_matches(pt, orig_t, orig_p):
-        """Returns True if keypoint `pt` matches the given time and pressure/toggle value."""
+        """Returns True if keypoint `pt` matches the given time and relay state value."""
         if abs(pt[0] - orig_t) >= 1e-5:
             return False
-        if isinstance(orig_p, str):
-            return pt[1] == orig_p
-        return isinstance(pt[1], (int, float)) and abs(pt[1] - orig_p) < 1e-5
+        try:
+            return (1 if int(pt[1]) != 0 else 0) == (1 if int(orig_p) != 0 else 0)
+        except (TypeError, ValueError):
+            return False
 
     def _add_toggle_keypoint(self, toggle_type):
-        """Shared logic for adding an 'off' or 'on' toggle keypoint at the given time."""
+        """Shared logic for adding an OFF/ON relay keypoint at the given time."""
         try:
             t = float(self.ent_prog_time.get())
             if t < 0:
@@ -1259,12 +1425,13 @@ class PneumaticGUI:
             if abs(pt[0] - t) >= 1e-5
         ]
 
-        self.current_program[ch_idx].append((t, toggle_type))
+        relay_state = 1 if toggle_type == "on" else 0
+        self.current_program[ch_idx].append((t, relay_state))
         self.current_program[ch_idx].sort(key=lambda x: x[0])
 
         # Clear selection
         self.selected_keypoint = None
-        self.btn_add_pt.config(text="Add Keypoint")
+        self.btn_add_pt.config(text="Add Relay Keypoint")
         if hasattr(self, 'btn_delete_pt'):
             self.btn_delete_pt.config(state="disabled")
 
@@ -1280,87 +1447,94 @@ class PneumaticGUI:
         """Inserts an 'on' toggle keypoint at the specified time."""
         self._add_toggle_keypoint("on")
 
+    def add_hv_keypoint(self):
+        """Adds or updates a shared HV1/HV2 setpoint keypoint at a given time."""
+        try:
+            t = float(self.ent_hv_time.get())
+            if t < 0:
+                raise ValueError
+            hv1 = self._clamp_hv_value(float(self.ent_hv1.get()))
+            hv2 = self._clamp_hv_value(float(self.ent_hv2.get()))
+        except (ValueError, TypeError):
+            messagebox.showerror("Invalid Input", "Enter valid HV keypoint values: time >= 0 and HV1/HV2 as numbers.")
+            return
+
+        for hv_key, hv_value in (("hv1", hv1), ("hv2", hv2)):
+            points = self.current_hv_program.get(hv_key, [])
+            points = [pt for pt in points if abs(pt[0] - t) >= 1e-5]
+            points.append((t, hv_value))
+            points.sort(key=lambda x: x[0])
+            self.current_hv_program[hv_key] = points
+
+        self.update_program_graph()
+
+    def clear_hv_keypoints(self):
+        """Clears all HV keypoints for the current action draft."""
+        self.current_hv_program = {"hv1": [], "hv2": []}
+        if hasattr(self, 'ent_hv_time'):
+            self.ent_hv_time.delete(0, tk.END)
+        if hasattr(self, 'ent_hv1'):
+            self.ent_hv1.delete(0, tk.END)
+        if hasattr(self, 'ent_hv2'):
+            self.ent_hv2.delete(0, tk.END)
+        self.update_program_graph()
+
     def update_program_graph(self):
         """Redraws the preview graph in the program tab."""
         self.ax_prog.clear()
         self.ax_prog.set_title("Action Preview")
         self.ax_prog.set_xlabel("Time (s)")
-        self.ax_prog.set_ylabel("Pressure (kPa)")
+        self.ax_prog.set_ylabel("Relay State")
+        self.ax_prog.set_ylim(-0.1, 1.1)
+        self.ax_prog.set_yticks([0, 1])
+        self.ax_prog.set_yticklabels(["OFF", "ON"])
         self.ax_prog.grid(True)
+
+        ax_hv = self.ax_prog.twinx()
+        ax_hv.set_ylabel("HV (V)")
+        ax_hv.set_ylim(self.hv_y_limits[0][0], self.hv_y_limits[0][1])
+        ax_hv.grid(False)
         
         max_t = 0
         
-        # Only plot channels that have points
+        # Plot relay state traces
         for ch_idx, points in self.current_program.items():
             if not points: continue
             if ch_idx >= self.num_channels: continue
             
             if hasattr(self, 'prog_vis_vars') and not self.prog_vis_vars[ch_idx].get():
                 continue
-            
-            # Separate pressure keypoints from toggle keypoints
-            pressure_pts = [(t, p) for t, p in points if isinstance(p, (int, float))]
-            off_pts = [t for t, p in points if p == "off"]
-            on_pts  = [t for t, p in points if p == "on"]
-            
-            # Get color from the default color cycle for this channel
-            color = None  # will be assigned by the first plot call
 
-            # Plot pressure curve (step function) with markers
-            if pressure_pts:
-                ts = [pt[0] for pt in pressure_pts]
-                ps = [pt[1] for pt in pressure_pts]
-                line, = self.ax_prog.plot(
-                    ts, ps,
-                    marker='o',
-                    drawstyle='steps-post',
-                    label=f"Ch {ch_idx+1}",
-                    picker=5
-                )
-                line.set_gid(ch_idx)
-                color = line.get_color()
-                if ts: max_t = max(max_t, max(ts))
-            else:
-                # Channel has only toggle points — still pick a color
-                color = f"C{ch_idx % 10}"
-            
-            # Plot OFF toggle markers (triangle-down)
-            if off_pts:
-                self.ax_prog.plot(
-                    off_pts, [0] * len(off_pts),
-                    marker='v', markersize=10, linestyle='None',
-                    color=color, markeredgecolor='red', markeredgewidth=1.5,
-                    label=f"Ch {ch_idx+1} OFF" if not pressure_pts else None
-                )
-                max_t = max(max_t, max(off_pts))
+            sorted_points = sorted(points, key=lambda x: x[0])
+            ts = [pt[0] for pt in sorted_points]
+            rs = [self._sanitize_relay_state(pt[1]) for pt in sorted_points]
+            self.ax_prog.step(ts, rs, where='post', marker='o', label=f"R{ch_idx+1}")
+            if ts:
+                max_t = max(max_t, max(ts))
 
-            # Plot ON toggle markers (triangle-up)
-            if on_pts:
-                self.ax_prog.plot(
-                    on_pts, [0] * len(on_pts),
-                    marker='^', markersize=10, linestyle='None',
-                    color=color, markeredgecolor='green', markeredgewidth=1.5,
-                    label=f"Ch {ch_idx+1} ON" if not pressure_pts else None
-                )
-                max_t = max(max_t, max(on_pts))
-
-            # Draw shaded OFF regions
-            all_sorted = sorted(points, key=lambda pt: pt[0])
-            off_start = None
-            for t_pt, val in all_sorted:
-                if val == "off":
-                    off_start = t_pt
-                elif off_start is not None:
-                    # Any non-off keypoint ends the off region
-                    self.ax_prog.axvspan(off_start, t_pt, alpha=0.08, color=color)
-                    off_start = None
-            # If still off at the end, shade to max_t
-            if off_start is not None and max_t > off_start:
-                self.ax_prog.axvspan(off_start, max_t, alpha=0.08, color=color)
+        # Plot HV setpoint traces
+        hv_styles = {
+            "hv1": ("black", "HV1"),
+            "hv2": ("tab:purple", "HV2"),
+        }
+        for hv_key, (color, label) in hv_styles.items():
+            points = sorted(self.current_hv_program.get(hv_key, []), key=lambda x: x[0])
+            if not points:
+                continue
+            ts = [pt[0] for pt in points]
+            vs = [self._clamp_hv_value(pt[1]) for pt in points]
+            ax_hv.step(ts, vs, where='post', color=color, linewidth=2.0, label=label)
+            max_t = max(max_t, max(ts))
             
         if max_t > 0:
             self.ax_prog.set_xlim(0, max_t * 1.1)
-            self.ax_prog.legend()
+        else:
+            self.ax_prog.set_xlim(0, max(5.0, self.x_timespan))
+
+        lines_r, labels_r = self.ax_prog.get_legend_handles_labels()
+        lines_h, labels_h = ax_hv.get_legend_handles_labels()
+        if lines_r or lines_h:
+            self.ax_prog.legend(lines_r + lines_h, labels_r + labels_h, loc="upper left", fontsize=8)
             
         self.canvas_prog.draw()
 
@@ -1374,7 +1548,12 @@ class PneumaticGUI:
         # 1. Find total duration
         total_duration = 0.0
         for i in range(self.num_channels):
-            points = self.current_program.get(i, [])
+            points = sorted(self.current_program.get(i, []), key=lambda x: x[0])
+            if points:
+                total_duration = max(total_duration, points[-1][0])
+
+        for hv_key in ("hv1", "hv2"):
+            points = sorted(self.current_hv_program.get(hv_key, []), key=lambda x: x[0])
             if points:
                 total_duration = max(total_duration, points[-1][0])
                 
@@ -1382,40 +1561,45 @@ class PneumaticGUI:
             messagebox.showwarning("Warning", "Action has no duration.")
             return
 
-        # 2. Pad channels
-        final_channels = {}
+        # 2. Normalize relay channels
+        final_relays = {}
         for i in range(self.num_channels):
-            points = self.current_program.get(i, [])
-            export_points = [list(pt) for pt in points]
+            points = sorted(self.current_program.get(i, []), key=lambda x: x[0])
+            export_points = [[float(t), self._sanitize_relay_state(v)] for t, v in points]
 
-            # Check if channel has ANY pressure keypoints (not just toggles)
-            has_pressure = any(isinstance(pt[1], (int, float)) for pt in points)
-            has_any = len(export_points) > 0
+            if export_points and export_points[0][0] > 0.0:
+                export_points.insert(0, [0.0, 0])
 
-            if not has_any:
-                # No keypoints at all → will be auto-detected as off by execution
-                # Don't pad with zeros; leave empty so automatic off detection works.
-                final_channels[str(i+1)] = []
-            elif not has_pressure:
-                # Only toggle keypoints, no pressure values → pad start if needed
-                if export_points[0][0] > 0:
-                    export_points.insert(0, [0.0, 0.0])  # start active at 0 until first toggle
-                final_channels[str(i+1)] = export_points
+            if export_points and export_points[-1][0] < total_duration:
+                export_points.append([total_duration, export_points[-1][1]])
+
+            final_relays[str(i + 1)] = export_points
+
+        def normalize_hv_points(points):
+            normalized = sorted([(float(t), self._clamp_hv_value(v)) for t, v in points], key=lambda x: x[0])
+            export = [[t, v] for t, v in normalized]
+            if not export:
+                export = [[0.0, 0.0], [total_duration, 0.0]]
             else:
-                if export_points[0][0] > 0:
-                    export_points.insert(0, [0.0, 0.0])
-                
-                last_t, last_p = export_points[-1]
-                if last_t < total_duration:
-                    export_points.append([total_duration, last_p])
-                    
-                final_channels[str(i+1)] = export_points
+                if export[0][0] > 0.0:
+                    export.insert(0, [0.0, 0.0])
+                if export[-1][0] < total_duration:
+                    export.append([total_duration, export[-1][1]])
+            return export
 
-        # 3. Create JSON structure
+        hv_setpoints = {
+            "hv1": normalize_hv_points(self.current_hv_program.get("hv1", [])),
+            "hv2": normalize_hv_points(self.current_hv_program.get("hv2", [])),
+        }
+
+        # 3. Create JSON structure (HV-only schema)
         action_data = {
             "name": name,
+            "type": "hv_action",
+            "schema_version": 2,
             "total_duration": total_duration,
-            "channels": final_channels
+            "relay_channels": final_relays,
+            "hv_setpoints": hv_setpoints,
         }
         
         # 4. Save to file
@@ -1505,6 +1689,8 @@ class PneumaticGUI:
         lbl_queue = ttk.Label(sidebar, text="Execution Queue", font=("Arial", 10, "bold"))
         lbl_queue.pack(pady=(10, 0))
 
+        ttk.Label(sidebar, text="Channels 9-20 are virtual (GUI-only)", foreground="gray").pack(pady=(2, 0))
+
         self.queue_listbox = tk.Listbox(sidebar, height=10)
         self.queue_listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
@@ -1567,7 +1753,7 @@ class PneumaticGUI:
         self.ch_vars = []
         
         for i in range(self.num_channels):
-            var = tk.BooleanVar(value=True)
+            var = tk.BooleanVar(value=(i < self.hardware_relay_count))
             self.ch_vars.append(var)
             cb = ttk.Checkbutton(self.checkbox_frame, text=f"Ch{i+1}", variable=var, command=self.update_graph_visibility)
             cb.pack(side=tk.LEFT, padx=2)
@@ -1575,7 +1761,7 @@ class PneumaticGUI:
         self.update_graph_visibility()
 
     def open_graph_settings(self):
-        """Opens a window to configure Y-axis limits for each channel."""
+        """Opens a window to configure relay and HV graph ranges."""
         settings_win = tk.Toplevel(self.root)
         settings_win.title("Graph Settings")
         settings_win.geometry("450x500") 
@@ -1600,11 +1786,12 @@ class PneumaticGUI:
         scrollbar.pack(side="right", fill="y")
 
         entries = []
+        hv_entries = []
 
         # Header inside scrollable frame
         ttk.Label(scrollable_frame, text="Channel").grid(row=0, column=0, padx=5, pady=5)
-        ttk.Label(scrollable_frame, text="Min Y (kPa)").grid(row=0, column=1, padx=5, pady=5)
-        ttk.Label(scrollable_frame, text="Max Y (kPa)").grid(row=0, column=2, padx=5, pady=5)
+        ttk.Label(scrollable_frame, text="Min Y (state)").grid(row=0, column=1, padx=5, pady=5)
+        ttk.Label(scrollable_frame, text="Max Y (state)").grid(row=0, column=2, padx=5, pady=5)
 
         for i in range(self.num_channels):
             ttk.Label(scrollable_frame, text=f"Ch {i+1}").grid(row=i+1, column=0, padx=5, pady=2)
@@ -1620,6 +1807,25 @@ class PneumaticGUI:
             ent_max.grid(row=i+1, column=2, padx=5, pady=2)
             
             entries.append((ent_min, ent_max))
+
+        hv_row_start = self.num_channels + 2
+        ttk.Label(scrollable_frame, text="HV Trace").grid(row=hv_row_start, column=0, padx=5, pady=(10, 5), sticky="w")
+        ttk.Label(scrollable_frame, text="Min Y (V)").grid(row=hv_row_start, column=1, padx=5, pady=(10, 5))
+        ttk.Label(scrollable_frame, text="Max Y (V)").grid(row=hv_row_start, column=2, padx=5, pady=(10, 5))
+
+        for hv_idx, hv_name in enumerate(("HV1", "HV2")):
+            ttk.Label(scrollable_frame, text=hv_name).grid(row=hv_row_start + hv_idx + 1, column=0, padx=5, pady=2, sticky="w")
+            min_hv, max_hv = self.hv_y_limits[hv_idx]
+
+            ent_hv_min = ttk.Entry(scrollable_frame, width=10)
+            ent_hv_min.insert(0, str(min_hv))
+            ent_hv_min.grid(row=hv_row_start + hv_idx + 1, column=1, padx=5, pady=2)
+
+            ent_hv_max = ttk.Entry(scrollable_frame, width=10)
+            ent_hv_max.insert(0, str(max_hv))
+            ent_hv_max.grid(row=hv_row_start + hv_idx + 1, column=2, padx=5, pady=2)
+
+            hv_entries.append((ent_hv_min, ent_hv_max))
 
         # X-axis Timespan Setting (Outside scrollable area, at bottom of window)
         bottom_frame = ttk.Frame(settings_win)
@@ -1642,6 +1848,18 @@ class PneumaticGUI:
                     self.y_limits[i] = (new_min, new_max)
                 except ValueError:
                     messagebox.showerror("Error", f"Ch {i+1}: Invalid number format.")
+                    return False
+
+            for hv_idx, (e_min, e_max) in enumerate(hv_entries):
+                try:
+                    new_min = float(e_min.get())
+                    new_max = float(e_max.get())
+                    if new_min >= new_max:
+                        messagebox.showerror("Error", f"HV{hv_idx+1}: Min must be less than Max.")
+                        return False
+                    self.hv_y_limits[hv_idx] = (new_min, new_max)
+                except ValueError:
+                    messagebox.showerror("Error", f"HV{hv_idx+1}: Invalid number format.")
                     return False
             
             # Validate and apply X timespan
@@ -1674,17 +1892,13 @@ class PneumaticGUI:
         btn_default.pack(side="right", padx=5)
 
     def update_graph_visibility(self):
-        """Re-draws the figure with only selected channels, rearranging them."""
+        """Re-draws relay plots plus two HV plots, rearranging them."""
         self.fig.clear()
         self.plot_handles.clear()
         
         # Identify which channels are selected
         selected_indices = [i for i, var in enumerate(self.ch_vars) if var.get()]
-        num_plots = len(selected_indices)
-        
-        if num_plots == 0:
-            self.canvas.draw()
-            return
+        num_plots = len(selected_indices) + 2
 
         # Calculate grid dimensions
         cols = 2 if num_plots > 1 else 1
@@ -1693,11 +1907,14 @@ class PneumaticGUI:
         for idx, channel_idx in enumerate(selected_indices):
             # add_subplot(rows, cols, index) where index starts at 1
             ax = self.fig.add_subplot(rows, cols, idx + 1)
-            ax.set_title(f"Channel {channel_idx + 1}", fontsize=8)
+            title_suffix = " (virtual)" if channel_idx >= self.hardware_relay_count else ""
+            ax.set_title(f"Relay Ch {channel_idx + 1}{title_suffix}", fontsize=8)
             
             # Apply stored Y-limits
             y_min, y_max = self.y_limits[channel_idx]
             ax.set_ylim(y_min, y_max)
+            ax.set_yticks([0, 1])
+            ax.set_yticklabels(["OFF", "ON"])
             
             # Apply stored X-timespan
             ax.set_xlim(0, self.x_timespan)
@@ -1709,10 +1926,32 @@ class PneumaticGUI:
             line_actual, = ax.plot([], [], 'b-', label='Actual')
             
             # Store handles for future data updates
-            self.plot_handles[channel_idx] = {
+            self.plot_handles[f"relay_{channel_idx}"] = {
                 'ax': ax,
                 'line_target': line_target,
-                'line_actual': line_actual
+                'line_actual': line_actual,
+                'kind': 'relay',
+                'index': channel_idx,
+            }
+
+        hv_start = len(selected_indices)
+        for hv_idx in range(2):
+            ax = self.fig.add_subplot(rows, cols, hv_start + hv_idx + 1)
+            ax.set_title(f"HV{hv_idx + 1} (V)", fontsize=8)
+            y_min, y_max = self.hv_y_limits[hv_idx]
+            ax.set_ylim(y_min, y_max)
+            ax.set_xlim(0, self.x_timespan)
+            ax.grid(True)
+
+            line_target, = ax.plot([], [], 'm--', label='Target')
+            line_actual, = ax.plot([], [], 'k-', label='Actual')
+
+            self.plot_handles[f"hv_{hv_idx}"] = {
+                'ax': ax,
+                'line_target': line_target,
+                'line_actual': line_actual,
+                'kind': 'hv',
+                'index': hv_idx,
             }
 
         self.fig.tight_layout()
@@ -1885,8 +2124,14 @@ class PneumaticGUI:
                 return
 
             try:
+                pending_map = self._collect_pending_map()
+
                 # Instantiate the communication class with the selected port
-                self.comm = SerialCommunication(port=selected_port, baudrate=115200)
+                self.comm = SerialCommunication(
+                    port=selected_port,
+                    baudrate=115200,
+                    mapping_on_connect=pending_map,
+                )
 
                 # SerialCommunication.connect() may fail without throwing; validate we are actually connected.
                 if not self._is_hardware_connected():
@@ -1895,9 +2140,9 @@ class PneumaticGUI:
                 # Connection successful -> allow future warnings again
                 self.hardware_disconnected_warned = False
 
-                # Send all-off so every channel is dormant until an action starts
-                off_cmd = "<" + ",".join(["off"] * self.num_channels) + ">"
-                self.comm.send_command(off_cmd)
+                # Send safe control frame so every relay/HV output starts from OFF/0V.
+                safe_cmd = self._send_safe_state()
+                print(f"Connected. Safe state sent: {safe_cmd}")
                 
                 # Update UI
                 self.btn_connect.config(text="Disconnect")
@@ -1905,10 +2150,12 @@ class PneumaticGUI:
                 self.port_combo.config(state="disabled")
                 self.btn_refresh.config(state="disabled")
                 self.btn_send.config(state="normal")
+                self._set_mapping_controls_locked(True)
                 
             except Exception as e:
                 messagebox.showerror("Connection Error", f"Could not connect:\n{e}")
                 self.comm = None
+                self._set_mapping_controls_locked(False)
         else:
             # Disconnect
             try:
@@ -1923,6 +2170,7 @@ class PneumaticGUI:
             self.port_combo.config(state="readonly")
             self.btn_refresh.config(state="normal")
             self.btn_send.config(state="disabled")
+            self._set_mapping_controls_locked(False)
 
     def toggle_pause(self):
         """Toggles between Pause and Resume states."""
@@ -1933,15 +2181,9 @@ class PneumaticGUI:
             self.btn_pause.config(text="RESUME", bg="green", fg="white")
             self.btn_download_graph.config(state="normal")
             
-            # Hold Pressure
-            currents = self.latest_pressures[:self.num_channels]
-            cmd_str = "<" + ",".join([f"{p:.1f}" for p in currents]) + ">"
-            if self.comm:
-                ok = self.comm.send_command(cmd_str)
-                if not ok and getattr(self.comm, 'disconnected', False):
-                    self._handle_hardware_disconnected(getattr(self.comm, 'disconnected_reason', None))
-            self.parse_and_store_target(cmd_str) # Update target plot to show holding
-            print(f"PAUSED: Holding pressures at {cmd_str}")
+            # Enforce safe state while paused.
+            cmd_str = self._send_safe_state()
+            print(f"PAUSED: Forced safe state {cmd_str}")
 
             # Setup Scrollbar (always show it in pause mode)
             min_t = None
@@ -2004,10 +2246,13 @@ class PneumaticGUI:
             print(f"Cancelling action: {self.current_action}")
             self.current_action = None
             self.current_action_data = None
-            self.current_action_channels = {}
+            self.current_action_relay_channels = {}
             self.current_action_times = []
-            self.current_action_pressures = []
+            self.current_action_states = []
             self.current_action_indices = []
+            self.current_action_hv_times = []
+            self.current_action_hv_values = []
+            self.current_action_hv_indices = []
 
             # Remove from UI Queue (Head is at index 0)
             if self.queue_listbox.size() > 0:
@@ -2016,6 +2261,8 @@ class PneumaticGUI:
             # Remove from internal list
             if self.action_queue:
                 self.action_queue.pop(0)
+
+            self._send_safe_state()
 
     def on_history_scroll(self, value):
         """Updates graph view based on scrollbar position during pause."""
@@ -2056,20 +2303,22 @@ class PneumaticGUI:
         self.canvas.draw_idle()
 
     def parse_and_store_target(self, cmd):
-        """Parses a command string <v1,v2...> and updates current_targets.
-        Tokens that are 'off' are stored as NaN so the plotter breaks the target line."""
+        """Parses a control command <r1..r8,v1,v2> and updates local target state."""
         if cmd.startswith('<') and cmd.endswith('>'):
             content = cmd[1:-1]
             try:
-                parts = content.split(',')
-                for i, tok in enumerate(parts):
-                    if i < len(self.current_targets):
-                        tok = tok.strip()
-                        if tok.lower() == 'off':
-                            self.current_targets[i] = float('nan')
-                        else:
-                            self.current_targets[i] = float(tok)
-            except:
+                parts = [p.strip() for p in content.split(',')]
+                if len(parts) != 10:
+                    return
+
+                relay_targets = list(self.current_relay_targets)
+                for i in range(min(self.hardware_relay_count, self.num_channels)):
+                    relay_targets[i] = self._sanitize_relay_state(parts[i])
+
+                hv1 = self._clamp_hv_value(parts[8])
+                hv2 = self._clamp_hv_value(parts[9])
+                self._apply_local_control_state(relay_targets, hv1, hv2)
+            except Exception:
                 pass
 
     def send_command(self):
@@ -2077,10 +2326,18 @@ class PneumaticGUI:
         if self.comm:
             cmd = self.cmd_entry.get()
             if cmd:
+                stripped = cmd.strip()
+                if stripped.upper().startswith("<MAP,"):
+                    messagebox.showwarning(
+                        "MAP Locked",
+                        "Runtime MAP updates are blocked from the debug box. Disconnect first and edit mapping in the Communication tab.",
+                    )
+                    return
+
                 success = self.comm.send_command(cmd)
                 if success:
                     print(f"Sent: {cmd}")
-                    self.parse_and_store_target(cmd) # Update targets for plotting
+                    self.parse_and_store_target(cmd)
                     # Try to read immediate response
                     response = self.comm.read_response()
                     if getattr(self.comm, 'disconnected', False):
@@ -2099,12 +2356,14 @@ class PneumaticGUI:
         selection = self.action_listbox.curselection()
         if selection:
             action_name = self.action_listbox.get(selection[0])
+            if not self.get_action_details(action_name, show_errors=True):
+                return
             self.action_queue.append(action_name)
             self.queue_listbox.insert(tk.END, action_name)
             print(f"Added to queue: {action_name}")
 
     def emergency_stop(self):
-        """Stops everything, clears queue, holds pressure, and shows warning."""
+        """Stops everything, clears queue, forces OFF + 0V, and shows warning."""
         # 1. Clear Queue
         self.action_queue.clear()
         self.queue_listbox.delete(0, tk.END)
@@ -2113,23 +2372,22 @@ class PneumaticGUI:
         if self.current_action:
             print(f"Action '{self.current_action}' ABORTED by E-STOP.")
             self.current_action = None
+            self.current_action_data = None
+            self.current_action_relay_channels = {}
+            self.current_action_times = []
+            self.current_action_states = []
+            self.current_action_indices = []
+            self.current_action_hv_times = []
+            self.current_action_hv_values = []
+            self.current_action_hv_indices = []
             
-        # 3. Hold Pressure (Send current actuals as targets)
-        currents = self.latest_pressures[:self.num_channels]
-        # Format: <p1,p2,...>
-        cmd_str = "<" + ",".join([f"{p:.1f}" for p in currents]) + ">"
+        # 3. Force safe outputs
+        cmd_str = self._send_safe_state()
         
         if self.comm:
-            ok = self.comm.send_command(cmd_str)
-            if not ok and getattr(self.comm, 'disconnected', False):
-                self._handle_hardware_disconnected(getattr(self.comm, 'disconnected_reason', None))
-                print(f"E-STOP TRIGGERED: Hardware disconnected; would hold pressures at {cmd_str}")
-            else:
-                print(f"E-STOP TRIGGERED: Holding pressures at {cmd_str}")
+            print(f"E-STOP TRIGGERED: Forced safe state {cmd_str}")
         else:
-            print(f"E-STOP TRIGGERED: Not connected; would hold pressures at {cmd_str}")
-            
-        self.parse_and_store_target(cmd_str) # Update targets
+            print(f"E-STOP TRIGGERED: Not connected; would force safe state {cmd_str}")
 
         # 4. Show Warning Window
         self.show_estop_window()
@@ -2146,11 +2404,11 @@ class PneumaticGUI:
         y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 100
         win.geometry(f"+{x}+{y}")
         
-        lbl = tk.Label(win, text="SYSTEM HALTED\n\nQueue Cleared.\nPressures Held at Current Values.", 
+        lbl = tk.Label(win, text="SYSTEM HALTED\n\nQueue Cleared.\nRelays OFF, HV1/HV2 set to 0 V.", 
                        fg="red", bg="#ffcccc", font=("Arial", 14, "bold"))
         lbl.pack(expand=True, pady=20)
         
-        btn_reset = tk.Button(win, text="RESET SYSTEM (Set All to 0 kPa)", 
+        btn_reset = tk.Button(win, text="RESET SYSTEM (Relays OFF + 0 V)", 
                               bg="white", fg="black", font=("Arial", 11),
                               command=lambda: self.reset_system(win))
         btn_reset.pack(pady=20, ipadx=10, ipady=5)
@@ -2162,19 +2420,15 @@ class PneumaticGUI:
 
     def reset_system(self, window):
         """Resets all targets to 0 and closes the warning window."""
-        # Send 0 pressure to all channels
-        zero_cmd = "<" + ",".join(["0.0"] * self.num_channels) + ">"
+        zero_cmd = self._send_safe_state()
         
         if self.comm:
-            ok = self.comm.send_command(zero_cmd)
-            if not ok and getattr(self.comm, 'disconnected', False):
-                self._handle_hardware_disconnected(getattr(self.comm, 'disconnected_reason', None))
-                print(f"System Reset: Hardware disconnected; would send {zero_cmd}")
-            else:
-                print(f"System Reset: Sent {zero_cmd}")
+            print(f"System Reset: Sent safe state {zero_cmd}")
         else:
-            print(f"System Reset: Not connected; would send {zero_cmd}")
-        
-        self.parse_and_store_target(zero_cmd) # Update targets
+            print(f"System Reset: Not connected; would send safe state {zero_cmd}")
             
         window.destroy()
+
+
+# Backward compatibility for older imports.
+PneumaticGUI = HighVoltageGUI
